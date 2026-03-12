@@ -754,6 +754,9 @@ local function CheckForFertilization(inst)
     -- 保存本轮要处理的目标实体列表。
     local targets = {}
     local farm_tile_targets = {}
+    local farm_targets_by_key = {}
+    local farm_target_keys = {}
+    local other_targets = {}
 
     -- 在施肥半径内扫描所有实体。
     for _, v in ipairs(TheSim:FindEntities(x, y, z, inst.fertilization_range)) do
@@ -767,15 +770,39 @@ local function CheckForFertilization(inst)
                 local tile_key = GetFarmTileKey(tile_x, tile_z)
                 if not farm_tile_targets[tile_key] then
                     farm_tile_targets[tile_key] = true
-                    table.insert(targets, v)
+                    farm_targets_by_key[tile_key] = v
+                    table.insert(farm_target_keys, tile_key)
                 end
             end
         elseif (v.components.pickable and v.components.pickable:IsBarren())
             or (v.components.grower and v.components.grower.cycles_left == 0) then
             -- 非农场作物：收集本轮可施肥目标（但要排除已有在飞肥料的）
             if GetPendingTargetShots(inst, v) <= 0 then
-                table.insert(targets, v)
+                table.insert(other_targets, v)
             end
+        end
+    end
+
+    -- 农田串行模式：一次仅处理一个地块，当前地块完成后再切换下一个。
+    local selected_farm_target = nil
+    if #farm_target_keys > 0 then
+        if inst.current_farm_tile_key ~= nil then
+            selected_farm_target = farm_targets_by_key[inst.current_farm_tile_key]
+        end
+
+        if selected_farm_target == nil then
+            table.sort(farm_target_keys)
+            inst.current_farm_tile_key = farm_target_keys[1]
+            selected_farm_target = farm_targets_by_key[inst.current_farm_tile_key]
+        end
+
+        if selected_farm_target ~= nil then
+            table.insert(targets, selected_farm_target)
+        end
+    else
+        inst.current_farm_tile_key = nil
+        for _, v in ipairs(other_targets) do
+            table.insert(targets, v)
         end
     end
 
@@ -1027,6 +1054,7 @@ local function fn()
     inst.active_fill_targets = {}
     inst.pending_tile_additions = {}
     inst.pending_target_shots = {}
+    inst.current_farm_tile_key = nil
 
     -- 提高检查频率，减少农田从触发到开始喷射的等待时间。
     inst:DoPeriodicTask(CHECK_FERT_TIME, CheckForFertilization, INITIAL_CHECK_DELAY)
@@ -1096,3 +1124,4 @@ return
 
 
 
+-- 目前的遗留问题是同时存在多个养分值缺乏的农场，对多个农场施肥的情况下可能会导致肥料浪费
