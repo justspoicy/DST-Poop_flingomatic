@@ -158,6 +158,7 @@ GLOBAL.c_clearfarmnutrients = function(radius)
             ent.active_fill_targets = {}
             ent.pending_tile_additions = {}
             ent.pending_target_shots = {}
+            ent.tile_zero_latches = {}
         end
     end
 

@@ -127,6 +127,22 @@ local function GetPendingTargetShots(inst, target)
     return inst.pending_target_shots[target.GUID] or 0
 end
 
+local function GetTileZeroLatchData(inst, tile_key)
+    if tile_key == nil then
+        return nil
+    end
+
+    inst.tile_zero_latches = inst.tile_zero_latches or {}
+
+    local latch = inst.tile_zero_latches[tile_key]
+    if latch == nil then
+        latch = { false, false, false }
+        inst.tile_zero_latches[tile_key] = latch
+    end
+
+    return latch
+end
+
 local function ApplyPendingTargetShot(inst, target, delta)
     if target == nil then
         return
@@ -156,31 +172,70 @@ local function GetActiveFillPlan(inst, target, create_if_missing)
     local key = GetFarmTileKey(tile_x, tile_z)
     local plan = inst.active_fill_targets[key]
 
-    if plan == nil and create_if_missing
-        and (nutrient_1 == 0 or nutrient_2 == 0 or nutrient_3 == 0) then
-        local zero_at_start = {
-            nutrient_1 == 0,
-            nutrient_2 == 0,
-            nutrient_3 == 0,
-        }
+    local latch = GetTileZeroLatchData(inst, key)
+    local current_zero = {
+        nutrient_1 == 0,
+        nutrient_2 == 0,
+        nutrient_3 == 0,
+    }
 
-        local initial_index = nil
+    -- 养分离开 0 时重置锁存；下次再次降为 0 才允许触发新一轮。
+    for i = 1, 3 do
+        if latch[i] and not current_zero[i] then
+            latch[i] = false
+            DebugLog(
+                "latch_unlock tile=%s idx=%d nutrient=%d",
+                tostring(key),
+                i,
+                (i == 1 and (nutrient_1 or 0)) or (i == 2 and (nutrient_2 or 0)) or (nutrient_3 or 0)
+            )
+        end
+    end
+
+    if plan == nil and create_if_missing
+        and (current_zero[1] or current_zero[2] or current_zero[3]) then
+        local zero_at_start = { false, false, false }
         for i = 1, 3 do
-            if zero_at_start[i] then
-                initial_index = i
-                break
+            -- 仅在“本项从非 0 降为 0 的新触发”时纳入本轮计划。
+            if current_zero[i] and not latch[i] then
+                zero_at_start[i] = true
+                latch[i] = true
             end
         end
 
-        plan = {
-            -- 仅追踪“本轮启动时为 0”的养分项。
-            nutrients = zero_at_start,
-            current_nutrient_index = initial_index,
-            planned_nutrient_index = nil,
-            planned_item_prefab = nil,
-            planned_shots_remaining = 0,
-        }
-        inst.active_fill_targets[key] = plan
+        local has_new_zero_trigger = zero_at_start[1] or zero_at_start[2] or zero_at_start[3]
+
+        local initial_index = nil
+        if has_new_zero_trigger then
+            for i = 1, 3 do
+                if zero_at_start[i] then
+                    initial_index = i
+                    break
+                end
+            end
+
+            plan = {
+                -- 仅追踪“本轮新触发为 0”的养分项。
+                nutrients = zero_at_start,
+                current_nutrient_index = initial_index,
+                planned_nutrient_index = nil,
+                planned_item_prefab = nil,
+                planned_shots_remaining = 0,
+            }
+            inst.active_fill_targets[key] = plan
+
+            DebugLog(
+                "plan_create tile=%s zero=(%s,%s,%s) initial=%s nutrient=(%d,%d,%d)",
+                tostring(key),
+                tostring(zero_at_start[1]),
+                tostring(zero_at_start[2]),
+                tostring(zero_at_start[3]),
+                tostring(initial_index),
+                nutrient_1 or 0,
+                nutrient_2 or 0,
+                nutrient_3 or 0
+            )
+        end
     end
 
     if plan == nil then
@@ -215,6 +270,7 @@ local function GetActiveFillPlan(inst, target, create_if_missing)
         end
     end
 
+    local prev_index = current_index
     if current_index == nil
         or not plan.nutrients[current_index]
         or (nutrient_values[current_index] >= MAX_FARM_NUTRIENT and not wait_for_inflight_settle) then
@@ -233,6 +289,21 @@ local function GetActiveFillPlan(inst, target, create_if_missing)
             plan.planned_nutrient_index = nil
             plan.planned_item_prefab = nil
             plan.planned_shots_remaining = 0
+        end
+
+        if prev_index ~= current_index then
+            DebugLog(
+                "index_switch tile=%s from=%s to=%s projected=(%d,%d,%d) nutrient=(%d,%d,%d)",
+                tostring(key),
+                tostring(prev_index),
+                tostring(current_index),
+                nutrient_values[1] or 0,
+                nutrient_values[2] or 0,
+                nutrient_values[3] or 0,
+                nutrient_1 or 0,
+                nutrient_2 or 0,
+                nutrient_3 or 0
+            )
         end
     end
 
@@ -296,6 +367,71 @@ local function GetTargetMissingNutrients(inst, target, create_if_missing)
 
     local _, requested_nutrients = GetActiveFillPlan(inst, target, create_if_missing ~= false)
     return requested_nutrients
+end
+
+local function HandleFertilizerDepleted(inst)
+    if inst.active_fill_targets == nil
+        or TheWorld.components.farming_manager == nil then
+        inst.current_farm_tile_key = nil
+        return
+    end
+
+    for tile_key, plan in pairs(inst.active_fill_targets) do
+        local tile_x, tile_z = string.match(tile_key, "^(-?%d+):(-?%d+)$")
+        tile_x = tonumber(tile_x)
+        tile_z = tonumber(tile_z)
+
+        if tile_x == nil or tile_z == nil or plan == nil then
+            inst.active_fill_targets[tile_key] = nil
+        else
+            local nutrient_1, nutrient_2, nutrient_3 =
+                TheWorld.components.farming_manager:GetTileNutrients(tile_x, tile_z)
+            local current_values = {
+                nutrient_1 or 0,
+                nutrient_2 or 0,
+                nutrient_3 or 0,
+            }
+
+            local latch = inst.tile_zero_latches ~= nil and inst.tile_zero_latches[tile_key] or nil
+            local changed = false
+
+            -- 断供收口：本轮中凡是已离开 0 的项，都视作本轮结束并放弃继续追打。
+            for i = 1, 3 do
+                if plan.nutrients ~= nil and plan.nutrients[i] and current_values[i] > 0 then
+                    plan.nutrients[i] = false
+                    changed = true
+
+                    if latch ~= nil then
+                        latch[i] = false
+                    end
+
+                    DebugLog(
+                        "supply_drop_abandon tile=%s idx=%d nutrient=%d",
+                        tostring(tile_key),
+                        i,
+                        current_values[i]
+                    )
+                end
+            end
+
+            if changed then
+                local idx = plan.current_nutrient_index
+                if idx ~= nil and (plan.nutrients == nil or not plan.nutrients[idx]) then
+                    plan.current_nutrient_index = nil
+                    plan.planned_nutrient_index = nil
+                    plan.planned_item_prefab = nil
+                    plan.planned_shots_remaining = 0
+                end
+            end
+
+            if plan.nutrients == nil
+                or (not plan.nutrients[1] and not plan.nutrients[2] and not plan.nutrients[3]) then
+                inst.active_fill_targets[tile_key] = nil
+            end
+        end
+    end
+
+    inst.current_farm_tile_key = nil
 end
 
 -- 给某个肥料打分，用于按缺项智能选肥。
@@ -375,6 +511,104 @@ local BASE_RANGE = 11
 
 local PLACER_SCALE = FERTILIZATION_RANGE / BASE_RANGE
 
+local function ApplyDefaultProjectileVisual(projectile)
+    projectile.AnimState:SetBank("poop")
+    projectile.AnimState:SetBuild("poop")
+    projectile.AnimState:PlayAnimation("idle", true)
+    projectile.AnimState:SetTime(0)
+end
+
+local function TryApplyProjectileItemVisual(projectile, item)
+    if projectile == nil
+        or item == nil
+        or not item:IsValid()
+        or item.AnimState == nil then
+        return false
+    end
+
+    local function NormalizeBank(bank)
+        if bank == "FROMNUM" then
+            return "birdegg"
+        end
+        return bank
+    end
+
+    -- 方案 1：优先直接从实体 AnimState 获取 bank/build/anim。
+    local direct_bank = nil
+    local direct_build = nil
+    local direct_anim = nil
+
+    if item.AnimState.GetBank ~= nil then
+        local ok, value = pcall(function()
+            return item.AnimState:GetBank()
+        end)
+        if ok then
+            direct_bank = value
+        end
+    end
+
+    if item.AnimState.GetBuild ~= nil then
+        local ok, value = pcall(function()
+            return item.AnimState:GetBuild()
+        end)
+        if ok then
+            direct_build = value
+        end
+    end
+
+    if item.AnimState.GetCurrentAnimationName ~= nil then
+        local ok, value = pcall(function()
+            return item.AnimState:GetCurrentAnimationName()
+        end)
+        if ok then
+            direct_anim = value
+        end
+    end
+
+    if direct_bank ~= nil and direct_build ~= nil then
+        local ok = pcall(function()
+            projectile.AnimState:SetBank(NormalizeBank(direct_bank))
+            projectile.AnimState:SetBuild(direct_build)
+            if direct_anim ~= nil and direct_anim ~= "" then
+                projectile.AnimState:PlayAnimation(direct_anim, false)
+            else
+                projectile.AnimState:PlayAnimation("idle", true)
+            end
+            projectile.AnimState:SetTime(0)
+        end)
+
+        if ok then
+            return true
+        end
+    end
+
+    -- 方案 2：回退到 debug string，并使用更宽松的解析规则。
+    if item.GetDebugString == nil then
+        return false
+    end
+
+    local dstring = item:GetDebugString()
+    if dstring == nil then
+        return false
+    end
+
+    local bank = string.match(dstring, "bank:%s*([^%s]+)")
+    local build = string.match(dstring, "build:%s*([^%s]+)")
+    local anim = string.match(dstring, "anim:%s*([^%s]+)")
+    if bank == nil or build == nil or anim == nil then
+        return false
+    end
+
+    local ok = pcall(function()
+        projectile.AnimState:SetBank(NormalizeBank(bank))
+        projectile.AnimState:SetBuild(build)
+        projectile.AnimState:PlayAnimation(anim, false)
+        projectile.AnimState:SetTime(0)
+    end)
+
+    return ok
+end
+
 
 local function OnEnableHelper(inst, enabled)
     if enabled then
@@ -440,6 +674,7 @@ local function LaunchProjectile(inst, target, item, reservation, reserve_target_
         projectile.Transform:SetPosition(x, y, z)
         -- 缩小抛射物视觉尺寸，避免遮挡。
         projectile.AnimState:SetScale(0.5, 0.5)
+        ApplyDefaultProjectileVisual(projectile)
 
         -- 给抛射物绑定目标，供命中时读取。
         projectile.target = target ~= nil and target:IsValid() and target or nil
@@ -454,25 +689,13 @@ local function LaunchProjectile(inst, target, item, reservation, reserve_target_
         -- 给抛射物绑定“肥料实体”，供命中时读取 nutrients。
         projectile.item   = item
 
-        -- 尝试复用物品动画，让飞出去的是“对应肥料外观”。
-        local dstring = item.GetDebugString and item:GetDebugString()
-        if dstring then
-            local bank, build, anim =
-                string.match(dstring, "AnimState: bank: (.*) build: (.*) anim: (.*) anim")
-            if bank and build and anim then
-                -- 特殊 bank 修正，避免某些数值 bank 导致动画异常。
-                if bank == "FROMNUM" then
-                    bank = "birdegg"
-                end
-                -- 应用读取到的 bank/build/anim。
-                projectile.AnimState:SetBank(bank)
-                projectile.AnimState:SetBuild(build)
-                projectile.AnimState:PlayAnimation(anim, false)
-                -- 把动画时间拉到末尾，避免飞行过程出现不合适帧。
-                projectile.AnimState:SetTime(
-                    projectile.AnimState:GetCurrentAnimationLength()
-                )
-            end
+        -- 优先复用物品动画；失败时自动回退默认 poop 动画，避免“隐形抛射物”。
+        if not TryApplyProjectileItemVisual(projectile, item) then
+            ApplyDefaultProjectileVisual(projectile)
+            DebugLog(
+                "projectile_visual_fallback item=%s",
+                tostring(item ~= nil and item.prefab or "nil")
+            )
         end
 
         -- 计算水平位移向量。
@@ -608,6 +831,11 @@ local function GetBestItemForTarget(inst, target)
         end
 
         local blocked_index = plan.current_nutrient_index
+        DebugLog(
+            "index_blocked tile=%s idx=%s reason=no_matching_item",
+            tostring(tile_key),
+            tostring(blocked_index)
+        )
         plan.nutrients[blocked_index] = false
         plan.current_nutrient_index = nil
         plan.planned_nutrient_index = nil
@@ -621,6 +849,52 @@ local function GetBestItemForTarget(inst, target)
     end
 
     return nil
+end
+
+local function CloneActiveFillPlan(plan)
+    if plan == nil then
+        return nil
+    end
+
+    return {
+        nutrients = {
+            plan.nutrients ~= nil and plan.nutrients[1] or false,
+            plan.nutrients ~= nil and plan.nutrients[2] or false,
+            plan.nutrients ~= nil and plan.nutrients[3] or false,
+        },
+        current_nutrient_index = plan.current_nutrient_index,
+        planned_nutrient_index = plan.planned_nutrient_index,
+        planned_item_prefab = plan.planned_item_prefab,
+        planned_shots_remaining = plan.planned_shots_remaining,
+    }
+end
+
+-- 候选探测专用：调用选肥逻辑但不污染 active_fill_targets 状态。
+local function ProbeBestItemForTarget(inst, target)
+    local tile_x, tile_z = GetFarmTileData(target)
+    local tile_key = tile_x ~= nil and GetFarmTileKey(tile_x, tile_z) or nil
+
+    local had_plan = false
+    local plan_snapshot = nil
+    if tile_key ~= nil and inst.active_fill_targets ~= nil then
+        local existing_plan = inst.active_fill_targets[tile_key]
+        if existing_plan ~= nil then
+            had_plan = true
+            plan_snapshot = CloneActiveFillPlan(existing_plan)
+        end
+    end
+
+    local best_item = select(1, GetBestItemForTarget(inst, target))
+
+    if tile_key ~= nil and inst.active_fill_targets ~= nil then
+        if had_plan then
+            inst.active_fill_targets[tile_key] = plan_snapshot
+        else
+            inst.active_fill_targets[tile_key] = nil
+        end
+    end
+
+    return best_item
 end
 
 local function BuildReservationForShot(inst, target, item, requested_nutrients)
@@ -744,6 +1018,7 @@ local function CheckForFertilization(inst)
             end
         end
         if not has_fertilizer then
+            HandleFertilizerDepleted(inst)
             return
         end
     end
@@ -783,21 +1058,41 @@ local function CheckForFertilization(inst)
         end
     end
 
-    -- 农田串行模式：一次仅处理一个地块，当前地块完成后再切换下一个。
+    -- 农田串行模式：一次仅处理一个“当前库存可施肥”的地块。
+    -- 若当前所有农田都暂时无可用肥料，则回退处理非农场目标，避免整机卡死。
     local selected_farm_target = nil
     if #farm_target_keys > 0 then
-        if inst.current_farm_tile_key ~= nil then
-            selected_farm_target = farm_targets_by_key[inst.current_farm_tile_key]
+        table.sort(farm_target_keys)
+
+        local ordered_keys = {}
+        if inst.current_farm_tile_key ~= nil and farm_targets_by_key[inst.current_farm_tile_key] ~= nil then
+            table.insert(ordered_keys, inst.current_farm_tile_key)
+        end
+        for _, key in ipairs(farm_target_keys) do
+            if key ~= inst.current_farm_tile_key then
+                table.insert(ordered_keys, key)
+            end
         end
 
-        if selected_farm_target == nil then
-            table.sort(farm_target_keys)
-            inst.current_farm_tile_key = farm_target_keys[1]
-            selected_farm_target = farm_targets_by_key[inst.current_farm_tile_key]
+        for _, key in ipairs(ordered_keys) do
+            local candidate = farm_targets_by_key[key]
+            if candidate ~= nil then
+                local candidate_item = ProbeBestItemForTarget(inst, candidate)
+                if candidate_item ~= nil then
+                    inst.current_farm_tile_key = key
+                    selected_farm_target = candidate
+                    break
+                end
+            end
         end
 
         if selected_farm_target ~= nil then
             table.insert(targets, selected_farm_target)
+        else
+            inst.current_farm_tile_key = nil
+            for _, v in ipairs(other_targets) do
+                table.insert(targets, v)
+            end
         end
     else
         inst.current_farm_tile_key = nil
@@ -1054,6 +1349,7 @@ local function fn()
     inst.active_fill_targets = {}
     inst.pending_tile_additions = {}
     inst.pending_target_shots = {}
+    inst.tile_zero_latches = {}
     inst.current_farm_tile_key = nil
 
     -- 提高检查频率，减少农田从触发到开始喷射的等待时间。
