@@ -221,6 +221,7 @@ local function GetActiveFillPlan(inst, target, create_if_missing)
                 planned_nutrient_index = nil,
                 planned_item_prefab = nil,
                 planned_shots_remaining = 0,
+                shots_fired = 0,
             }
             inst.active_fill_targets[key] = plan
 
@@ -369,7 +370,7 @@ local function GetTargetMissingNutrients(inst, target, create_if_missing)
     return requested_nutrients
 end
 
-local function HandleFertilizerDepleted(inst)
+local function SyncActiveFillPlans(inst)
     if inst.active_fill_targets == nil
         or TheWorld.components.farming_manager == nil then
         inst.current_farm_tile_key = nil
@@ -395,9 +396,13 @@ local function HandleFertilizerDepleted(inst)
             local latch = inst.tile_zero_latches ~= nil and inst.tile_zero_latches[tile_key] or nil
             local changed = false
 
-            -- 断供收口：本轮中凡是已离开 0 的项，都视作本轮结束并放弃继续追打。
+            -- 玩家接管收口：仅在本轮尚未发射过时，离开 0 才视作玩家接管。
+            -- 避免机器自己首发命中后就提前结束，导致补不满。
             for i = 1, 3 do
-                if plan.nutrients ~= nil and plan.nutrients[i] and current_values[i] > 0 then
+                if plan.nutrients ~= nil
+                    and plan.nutrients[i]
+                    and current_values[i] > 0
+                    and (plan.shots_fired or 0) <= 0 then
                     plan.nutrients[i] = false
                     changed = true
 
@@ -431,7 +436,10 @@ local function HandleFertilizerDepleted(inst)
         end
     end
 
-    inst.current_farm_tile_key = nil
+    if inst.current_farm_tile_key ~= nil
+        and inst.active_fill_targets[inst.current_farm_tile_key] == nil then
+        inst.current_farm_tile_key = nil
+    end
 end
 
 -- 给某个肥料打分，用于按缺项智能选肥。
@@ -866,6 +874,7 @@ local function CloneActiveFillPlan(plan)
         planned_nutrient_index = plan.planned_nutrient_index,
         planned_item_prefab = plan.planned_item_prefab,
         planned_shots_remaining = plan.planned_shots_remaining,
+        shots_fired = plan.shots_fired or 0,
     }
 end
 
@@ -1047,6 +1056,10 @@ local function CheckForFertilization(inst)
         return
     end
 
+    -- 每轮先同步计划：只要本轮追踪项已离开 0（>0），立即结束该项计划。
+    -- 这样玩家中途手动施肥会被视为“玩家接管”，机器不再继续追打该项。
+    SyncActiveFillPlans(inst)
+
     -- 容器为空时无需扫描目标，直接跳过整轮。
     if inst.components.container then
         local has_fertilizer = false
@@ -1057,7 +1070,6 @@ local function CheckForFertilization(inst)
             end
         end
         if not has_fertilizer then
-            HandleFertilizerDepleted(inst)
             return
         end
     end
@@ -1227,6 +1239,7 @@ local function CheckForFertilization(inst)
                     and plan.planned_shots_remaining ~= nil
                     and plan.planned_shots_remaining > 0 then
                     plan.planned_shots_remaining = plan.planned_shots_remaining - 1
+                    plan.shots_fired = (plan.shots_fired or 0) + 1
 
                     DebugLog(
                         "shot_sent tile=%s idx=%s item=%s shots_left=%d",
