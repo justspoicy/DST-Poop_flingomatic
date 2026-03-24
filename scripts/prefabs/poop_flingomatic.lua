@@ -938,6 +938,43 @@ local function BuildReservationForShot(inst, target, item, requested_nutrients)
     }
 end
 
+-- 这些瓶装肥料耐久耗尽后，会返还空瓶子。
+local EMPTY_BOTTLE_RETURN_MAP = {
+    soil_amender = "messagebottleempty",
+    soil_amender_fermented = "messagebottleempty",
+    compostwrap = "messagebottleempty",
+    supergrowthformula = "messagebottleempty",
+}
+
+local function ReturnContainerByproduct(inst, source_prefab)
+    if inst == nil or inst.components.container == nil or source_prefab == nil then
+        return
+    end
+
+    local byproduct_prefab = EMPTY_BOTTLE_RETURN_MAP[source_prefab]
+    if byproduct_prefab == nil then
+        return
+    end
+
+    local byproduct = SpawnPrefab(byproduct_prefab)
+    if byproduct == nil then
+        return
+    end
+
+    local accepted = inst.components.container:GiveItem(byproduct)
+    if not accepted and byproduct:IsValid() then
+        local x, y, z = inst.Transform:GetWorldPosition()
+        byproduct.Transform:SetPosition(x, y, z)
+    end
+
+    DebugLog(
+        "byproduct_return source=%s byproduct=%s accepted=%s",
+        tostring(source_prefab),
+        tostring(byproduct_prefab),
+        tostring(accepted)
+    )
+end
+
 
 -- 从容器里消费 1 份肥料，并返回用于投射的实体。
 -- 三种分支：
@@ -969,12 +1006,14 @@ local function ConsumeItemForProjectile(inst, item)
         end
     -- 有耐久肥料：消耗一次耐久，并复制一个同 prefab 抛射体。
     elseif item.components.finiteuses ~= nil then
+        local source_prefab = item.prefab
         item.components.finiteuses:Use()
         projectile_item = SpawnPrefab(item.prefab)
 
         -- 耐久耗尽时，从容器移除并删除原实体。
         if item.components.finiteuses:GetUses() <= 0 then
             inst.components.container:RemoveItem(item, true)
+            ReturnContainerByproduct(inst, source_prefab)
             item:Remove()
         end
     else
